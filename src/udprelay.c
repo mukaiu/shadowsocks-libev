@@ -245,6 +245,10 @@ static int
 parse_udprelay_header(const char *buf, const size_t buf_len,
                       char *host, char *port, struct sockaddr_storage *storage)
 {
+    if (buf_len < 1) {
+        return 0;
+    }
+
     const uint8_t atyp = *(uint8_t *)buf;
     int offset         = 1;
 
@@ -267,12 +271,16 @@ parse_udprelay_header(const char *buf, const size_t buf_len,
         }
     } else if ((atyp & ADDRTYPE_MASK) == 3) {
         // Domain name
+        if (buf_len < offset + 1) {
+            return 0;
+        }
         uint8_t name_len = *(uint8_t *)(buf + offset);
         if (name_len + 4 <= buf_len) {
             if (storage != NULL) {
                 char tmp[MAX_HOSTNAME_LEN] = { 0 };
                 struct cork_ip ip;
                 memcpy(tmp, buf + offset + 1, name_len);
+                tmp[name_len] = '\0';
                 if (cork_ip_init(&ip, tmp) != -1) {
                     if (ip.version == 4) {
                         struct sockaddr_in *addr = (struct sockaddr_in *)storage;
@@ -281,14 +289,18 @@ parse_udprelay_header(const char *buf, const size_t buf_len,
                         addr->sin_family = AF_INET;
                     } else if (ip.version == 6) {
                         struct sockaddr_in6 *addr = (struct sockaddr_in6 *)storage;
-                        inet_pton(AF_INET, tmp, &(addr->sin6_addr));
+                        inet_pton(AF_INET6, tmp, &(addr->sin6_addr));
                         memcpy(&addr->sin6_port, buf + offset + 1 + name_len, sizeof(uint16_t));
                         addr->sin6_family = AF_INET6;
                     }
+                } else if (!validate_hostname(tmp, name_len)) {
+                    LOGE("[udp] invalid host name");
+                    return 0;
                 }
             }
             if (host != NULL) {
                 memcpy(host, buf + offset + 1, name_len);
+                host[name_len] = '\0';
             }
             offset += 1 + name_len;
         }
@@ -316,7 +328,7 @@ parse_udprelay_header(const char *buf, const size_t buf_len,
     }
 
     if (port != NULL) {
-        sprintf(port, "%d", load16_be(buf + offset));
+        snprintf(port, MAX_PORT_STR_LEN, "%d", load16_be(buf + offset));
     }
     offset += 2;
 
@@ -339,14 +351,14 @@ get_addr_str(const struct sockaddr *sa, bool has_port)
         memcpy(&sa_in, sa, sizeof(struct sockaddr_in));
         inet_ntop(AF_INET, &sa_in.sin_addr, addr, INET_ADDRSTRLEN);
         p = ntohs(sa_in.sin_port);
-        sprintf(port, "%d", p);
+        snprintf(port, sizeof(port), "%d", p);
         break;
 
     case AF_INET6:
         memcpy(&sa_in6, sa, sizeof(struct sockaddr_in6));
         inet_ntop(AF_INET6, &sa_in6.sin6_addr, addr, INET6_ADDRSTRLEN);
         p = ntohs(sa_in6.sin6_port);
-        sprintf(port, "%d", p);
+        snprintf(port, sizeof(port), "%d", p);
         break;
 
     default:
@@ -355,10 +367,11 @@ get_addr_str(const struct sockaddr *sa, bool has_port)
 
     int addr_len = strlen(addr);
     int port_len = strlen(port);
-    memcpy(s, addr, addr_len);
+    // s is a zeroed static buffer large enough for addr + ':' + port
+    memcpy(s, addr, addr_len);  // NOLINT(bugprone-not-null-terminated-result)
 
     if (has_port) {
-        memcpy(s + addr_len + 1, port, port_len);
+        memcpy(s + addr_len + 1, port, port_len);  // NOLINT(bugprone-not-null-terminated-result)
         s[addr_len] = ':';
     }
 
@@ -625,6 +638,11 @@ close_and_free_remote(EV_P_ remote_ctx_t *ctx)
         ev_timer_stop(EV_A_ & ctx->watcher);
         ev_io_stop(EV_A_ & ctx->io);
         close(ctx->fd);
+        if (ctx->udp_session != NULL
+            && ctx->server_ctx != NULL
+            && ctx->server_ctx->crypto->udp_session_release != NULL) {
+            ctx->server_ctx->crypto->udp_session_release(ctx->udp_session);
+        }
         ss_free(ctx);
     }
 }
@@ -808,7 +826,10 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     buf->len = r;
 
 #ifdef MODULE_LOCAL
-    int err = server_ctx->crypto->decrypt_all(buf, server_ctx->crypto->cipher, buf_size);
+    int err = server_ctx->crypto->decrypt_udp != NULL
+              ? server_ctx->crypto->decrypt_udp(buf, server_ctx->crypto->cipher,
+                                                buf_size, &remote_ctx->udp_session)
+              : server_ctx->crypto->decrypt_all(buf, server_ctx->crypto->cipher, buf_size);
     if (err) {
         LOGE("failed to handshake with %s: %s",
                 get_addr_str((struct sockaddr *)&src_addr, false), "suspicious UDP packet");
@@ -867,7 +888,10 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     memcpy(buf->data, addr_header, addr_header_len);
     buf->len += addr_header_len;
 
-    int err = server_ctx->crypto->encrypt_all(buf, server_ctx->crypto->cipher, buf_size);
+    int err = server_ctx->crypto->encrypt_udp != NULL
+              ? server_ctx->crypto->encrypt_udp(buf, server_ctx->crypto->cipher,
+                                                buf_size, &remote_ctx->udp_session)
+              : server_ctx->crypto->encrypt_all(buf, server_ctx->crypto->cipher, buf_size);
     if (err) {
         // drop the packet silently
         goto CLEAN_UP;
@@ -1011,8 +1035,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         LOGE("[udp] unable to get dest addr");
         goto CLEAN_UP;
     }
-
-    src_addr_len = msg.msg_namelen;
 #else
     ssize_t r;
     r = recvfrom(server_ctx->fd, buf->data, buf_size,
@@ -1039,7 +1061,16 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 #ifdef MODULE_REMOTE
     tx += buf->len;
 
-    int err = server_ctx->crypto->decrypt_all(buf, server_ctx->crypto->cipher, buf_size);
+    /*
+     * AEAD-2022 routes by client session ID, which is only known after
+     * decryption, so the crypto layer resolves the session itself and hands
+     * it back here to be attached to the relay context.
+     */
+    void *udp_session = NULL;
+    int err = server_ctx->crypto->decrypt_udp != NULL
+              ? server_ctx->crypto->decrypt_udp(buf, server_ctx->crypto->cipher,
+                                                buf_size, &udp_session)
+              : server_ctx->crypto->decrypt_all(buf, server_ctx->crypto->cipher, buf_size);
     if (err) {
         LOGE("failed to handshake with %s: %s",
                 get_addr_str((struct sockaddr *)&src_addr, false), "suspicious UDP packet");
@@ -1053,6 +1084,10 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 #ifdef __ANDROID__
     tx += buf->len;
 #endif
+    if (buf->len < 3) {
+        LOGE("[udp] invalid SOCKS5 UDP header");
+        goto CLEAN_UP;
+    }
     uint8_t frag = *(uint8_t *)(buf->data + 2);
     offset += 3;
 #endif
@@ -1117,7 +1152,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     char addr_header[MAX_ADDR_HEADER_SIZE] = { 0 };
     char *host                             = server_ctx->tunnel_addr.host;
     char *port                             = server_ctx->tunnel_addr.port;
-    uint16_t port_num                      = (uint16_t)atoi(port);
+    uint16_t port_num                      = 0;
+    if (ss_parse_uint16_port(port, &port_num) == -1) {
+        LOGE("[udp] invalid tunnel port");
+        goto CLEAN_UP;
+    }
     uint16_t port_net_num                  = htons(port_num);
     int addr_header_len                    = 0;
 
@@ -1154,9 +1193,14 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         // send as domain
         int host_len = strlen(host);
 
+        if (host_len > UINT8_MAX) {
+            LOGE("[udp] tunnel host name is too long");
+            goto CLEAN_UP;
+        }
         addr_header[addr_header_len++] = 3;
         addr_header[addr_header_len++] = host_len;
-        memcpy(addr_header + addr_header_len, host, host_len);
+        // addr_header is a binary protocol buffer, not a C string
+        memcpy(addr_header + addr_header_len, host, host_len);  // NOLINT(bugprone-not-null-terminated-result)
         addr_header_len += host_len;
     }
     memcpy(addr_header + addr_header_len, &port_net_num, 2);
@@ -1307,7 +1351,10 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         memmove(buf->data, buf->data + offset, buf->len);
     }
 
-    int err = server_ctx->crypto->encrypt_all(buf, server_ctx->crypto->cipher, buf_size);
+    int err = server_ctx->crypto->encrypt_udp != NULL
+              ? server_ctx->crypto->encrypt_udp(buf, server_ctx->crypto->cipher,
+                                                buf_size, &remote_ctx->udp_session)
+              : server_ctx->crypto->encrypt_all(buf, server_ctx->crypto->cipher, buf_size);
 
     if (err) {
         // drop the packet silently
@@ -1387,6 +1434,11 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
     }
 
+    if (remote_ctx != NULL) {
+        // Attach the AEAD-2022 session so replies are encrypted with it
+        remote_ctx->udp_session = udp_session;
+    }
+
     if (remote_ctx != NULL && !need_query) {
         size_t addr_len = get_sockaddr_len((struct sockaddr *)&dst_addr);
         int s           = sendto(remote_ctx->fd, buf->data + addr_header_len,
@@ -1421,7 +1473,13 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             query_ctx->remote_ctx = remote_ctx;
         }
 
-        resolv_start(host, htons(atoi(port)), resolv_cb, resolv_free_cb, query_ctx);
+        int port_num = 0;
+        if (ss_parse_int(port, 0, UINT16_MAX, &port_num) == -1) {
+            LOGE("[udp] invalid target port");
+            resolv_free_cb(query_ctx);
+            goto CLEAN_UP;
+        }
+        resolv_start(host, htons((uint16_t)port_num), resolv_cb, resolv_free_cb, query_ctx);
     }
 #endif
 
@@ -1458,6 +1516,10 @@ init_udprelay(const char *server_host, const char *server_port,
 
     // Initialize MTU
     if (mtu > 0) {
+        if (mtu <= PACKET_HEADER_SIZE) {
+            LOGE("MTU must be greater than %d", PACKET_HEADER_SIZE);
+            return -1;
+        }
         packet_size = mtu - PACKET_HEADER_SIZE;
         buf_size    = packet_size * 2;
     }

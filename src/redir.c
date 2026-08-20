@@ -201,6 +201,14 @@ create_and_bind(const char *addr, const char *port)
             LOGI("tcp tproxy mode enabled");
         }
 
+        if (tcp_incoming_sndbuf > 0) {
+            setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
+        }
+
+        if (tcp_incoming_rcvbuf > 0) {
+            setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
+        }
+
         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
         if (s == 0) {
             /* We managed to bind successfully! */
@@ -686,6 +694,7 @@ new_server(int fd)
     server->d_ctx = ss_malloc(sizeof(cipher_ctx_t));
     crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
     crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
+    cipher_ctx_pair(server->e_ctx, server->d_ctx);
 
     ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
     ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
@@ -759,15 +768,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
     setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
 
-    if (tcp_incoming_sndbuf > 0) {
-        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
-    }
-
-    if (tcp_incoming_rcvbuf > 0) {
-        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
-    }
-
-    int index                    = rand() % listener->remote_num;
+    int index                    = (int)randombytes_uniform((uint32_t)listener->remote_num);
     struct sockaddr *remote_addr = listener->remote_addr[index];
 
     int protocol = IPPROTO_TCP;
@@ -891,12 +892,11 @@ signal_cb(EV_P_ ev_signal *w, int revents)
 int
 main(int argc, char **argv)
 {
-    srand(time(NULL));
-
     int i, c;
     int pid_flags    = 0;
     int mptcp        = 0;
     int mtu          = 0;
+    int timeout_secs = 0;
     char *user       = NULL;
     char *local_port = NULL;
     char *local_addr = NULL;
@@ -951,7 +951,9 @@ main(int argc, char **argv)
             fast_open = 1;
             break;
         case GETOPT_VAL_MTU:
-            mtu = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &mtu) == -1) {
+                FATAL("invalid MTU");
+            }
             LOGI("set MTU to %d", mtu);
             break;
         case GETOPT_VAL_MPTCP:
@@ -976,16 +978,24 @@ main(int argc, char **argv)
             reuse_port = 1;
             break;
         case GETOPT_VAL_TCP_INCOMING_SNDBUF:
-            tcp_incoming_sndbuf = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &tcp_incoming_sndbuf) == -1) {
+                FATAL("invalid TCP incoming send buffer size");
+            }
             break;
         case GETOPT_VAL_TCP_INCOMING_RCVBUF:
-            tcp_incoming_rcvbuf = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &tcp_incoming_rcvbuf) == -1) {
+                FATAL("invalid TCP incoming receive buffer size");
+            }
             break;
         case GETOPT_VAL_TCP_OUTGOING_SNDBUF:
-            tcp_outgoing_sndbuf = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &tcp_outgoing_sndbuf) == -1) {
+                FATAL("invalid TCP outgoing send buffer size");
+            }
             break;
         case GETOPT_VAL_TCP_OUTGOING_RCVBUF:
-            tcp_outgoing_rcvbuf = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &tcp_outgoing_rcvbuf) == -1) {
+                FATAL("invalid TCP outgoing receive buffer size");
+            }
             break;
         case 's':
             if (remote_num < MAX_REMOTE_NUM) {
@@ -1023,7 +1033,9 @@ main(int argc, char **argv)
             break;
 #ifdef HAVE_SETRLIMIT
         case 'n':
-            nofile = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &nofile) == -1) {
+                FATAL("invalid nofile");
+            }
             break;
 #endif
         case 'u':
@@ -1178,6 +1190,9 @@ main(int argc, char **argv)
     if (timeout == NULL) {
         timeout = "600";
     }
+    if (ss_parse_int(timeout, 1, INT_MAX, &timeout_secs) == -1) {
+        FATAL("invalid timeout");
+    }
 
 #ifdef HAVE_SETRLIMIT
     /*
@@ -1260,6 +1275,7 @@ main(int argc, char **argv)
         char *remote_str = ss_malloc(buf_size);
 
         snprintf(remote_str, buf_size, "%s", remote_addr[0].host);
+        len = strlen(remote_str);
         for (int i = 1; i < remote_num; i++) {
             snprintf(remote_str + len, buf_size - len, "|%s", remote_addr[i].host);
             len = strlen(remote_str);
@@ -1312,7 +1328,7 @@ main(int argc, char **argv)
         if (plugin != NULL)
             break;
     }
-    listen_ctx.timeout = atoi(timeout);
+    listen_ctx.timeout = timeout_secs;
     listen_ctx.mptcp   = mptcp;
 
     struct ev_loop *loop = EV_DEFAULT;
@@ -1354,8 +1370,11 @@ main(int argc, char **argv)
                 FATAL("failed to resolve the provided hostname");
             }
             struct sockaddr *addr = (struct sockaddr *)storage;
-            init_udprelay(local_addr, local_port, addr,
-                          get_sockaddr_len(addr), mtu, crypto, listen_ctx_current->timeout, NULL);
+            if (init_udprelay(local_addr, local_port, addr,
+                              get_sockaddr_len(addr), mtu, crypto,
+                              listen_ctx_current->timeout, NULL) == -1) {
+                FATAL("failed to initialize UDP relay");
+            }
         }
 
         if (mode == UDP_ONLY) {

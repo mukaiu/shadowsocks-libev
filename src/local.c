@@ -52,6 +52,7 @@
 #include <libcork/core.h>
 
 #include "netutils.h"
+#include "ssurl.h"
 #include "utils.h"
 #include "socks5.h"
 #include "acl.h"
@@ -203,6 +204,14 @@ create_and_bind(const char *addr, const char *port)
             if (err == 0) {
                 LOGI("tcp port reuse enabled");
             }
+        }
+
+        if (tcp_incoming_sndbuf > 0) {
+            setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
+        }
+
+        if (tcp_incoming_rcvbuf > 0) {
+            setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
         }
 
         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
@@ -388,9 +397,12 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
                 LOGI("inet_ntop(AF_INET): %s", strerror(errno));
                 ip[0] = '\0';
             }
-            sprintf(port, "%d", p);
+            snprintf(port, sizeof(port), "%d", p);
         }
     } else if (atyp == SOCKS5_ATYP_DOMAIN) {
+        if (buf->len < request_len + 1) {
+            return -1;
+        }
         uint8_t name_len = *(uint8_t *)(buf->data + request_len);
         if (buf->len < request_len + 1 + name_len + 2) {
             return -1;
@@ -403,7 +415,7 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
             uint16_t p = load16_be(buf->data + request_len + 1 + name_len);
             memcpy(host, buf->data + request_len + 1, name_len);
             host[name_len] = '\0';
-            sprintf(port, "%d", p);
+            snprintf(port, sizeof(port), "%d", p);
         }
     } else if (atyp == SOCKS5_ATYP_IPV6) {
         size_t in6_addr_len = sizeof(struct in6_addr);
@@ -420,7 +432,7 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
                 LOGI("inet_ntop(AF_INET6): %s", strerror(errno));
                 ip[0] = '\0';
             }
-            sprintf(port, "%d", p);
+            snprintf(port, sizeof(port), "%d", p);
         }
     } else {
         LOGE("unsupported addrtype: %d", request->atyp);
@@ -833,6 +845,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 struct sockaddr_in peer_addr;
                 socklen_t peer_addr_len = sizeof peer_addr;
                 if (getpeername(server->fd, (struct sockaddr *)&peer_addr, &peer_addr_len) == 0) {
+                    // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage): filled by getpeername() on success
                     LOGI("connection from %s:%hu", inet_ntoa(peer_addr.sin_addr), ntohs(peer_addr.sin_port));
                 }
             }
@@ -1205,6 +1218,7 @@ new_server(int fd)
     server->d_ctx = ss_malloc(sizeof(cipher_ctx_t));
     crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
     crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
+    cipher_ctx_pair(server->e_ctx, server->d_ctx);
 
     ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
     ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
@@ -1265,7 +1279,7 @@ create_remote(listen_ctx_t *listener,
 {
     struct sockaddr *remote_addr;
 
-    int index = rand() % listener->remote_num;
+    int index = (int)randombytes_uniform((uint32_t)listener->remote_num);
     if (addr == NULL) {
         remote_addr = listener->remote_addr[index];
     } else {
@@ -1406,14 +1420,6 @@ accept_cb(EV_P_ ev_io *w, int revents)
     setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
 
-    if (tcp_incoming_sndbuf > 0) {
-        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
-    }
-
-    if (tcp_incoming_rcvbuf > 0) {
-        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
-    }
-
     server_t *server = new_server(serverfd);
     server->listener = listener;
 
@@ -1428,6 +1434,7 @@ main(int argc, char **argv)
     int pid_flags    = 0;
     int mtu          = 0;
     int mptcp        = 0;
+    int timeout_secs = 0;
     char *user       = NULL;
     char *local_port = NULL;
     char *local_addr = NULL;
@@ -1449,8 +1456,10 @@ main(int argc, char **argv)
     ss_addr_t remote_addr[MAX_REMOTE_NUM];
     char *remote_port = NULL;
 
+    /* Lives until exit; its strings are handed to the config above. */
+    ss_url_t server_url = { 0 };
+
     memset(remote_addr, 0, sizeof(ss_addr_t) * MAX_REMOTE_NUM);
-    srand(time(NULL));
 
     static struct option long_options[] = {
         { "reuse-port",  no_argument,       NULL, GETOPT_VAL_REUSE_PORT  },
@@ -1467,6 +1476,7 @@ main(int argc, char **argv)
         { "plugin-opts", required_argument, NULL, GETOPT_VAL_PLUGIN_OPTS },
         { "password",    required_argument, NULL, GETOPT_VAL_PASSWORD    },
         { "key",         required_argument, NULL, GETOPT_VAL_KEY         },
+        { "server-url",  required_argument, NULL, GETOPT_VAL_SERVER_URL  },
         { "help",        no_argument,       NULL, GETOPT_VAL_HELP        },
         { NULL,          0,                 NULL, 0                      }
     };
@@ -1491,7 +1501,9 @@ main(int argc, char **argv)
             acl = !init_acl(optarg);
             break;
         case GETOPT_VAL_MTU:
-            mtu = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &mtu) == -1) {
+                FATAL("invalid MTU");
+            }
             LOGI("set MTU to %d", mtu);
             break;
         case GETOPT_VAL_MPTCP:
@@ -1512,20 +1524,52 @@ main(int argc, char **argv)
         case GETOPT_VAL_KEY:
             key = optarg;
             break;
+        case GETOPT_VAL_SERVER_URL:
+            /*
+             * An ss:// URI carries the server, credentials and plugin in one
+             * argument. Options given later on the command line still win,
+             * since they are applied as getopt reaches them.
+             */
+            if (ss_url_parse(optarg, &server_url) != 0) {
+                FATAL("invalid ss:// server URL");
+            }
+            if (remote_num < MAX_REMOTE_NUM) {
+                remote_addr[remote_num].host = server_url.host;
+                remote_addr[remote_num].port = NULL;
+                remote_num++;
+            }
+            remote_port = server_url.port;
+            method      = server_url.method;
+            password    = server_url.password;
+            if (server_url.plugin != NULL)
+                plugin = server_url.plugin;
+            if (server_url.plugin_opts != NULL)
+                plugin_opts = server_url.plugin_opts;
+            if (server_url.tag != NULL)
+                LOGI("using server \"%s\"", server_url.tag);
+            break;
         case GETOPT_VAL_REUSE_PORT:
             reuse_port = 1;
             break;
         case GETOPT_VAL_TCP_INCOMING_SNDBUF:
-            tcp_incoming_sndbuf = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &tcp_incoming_sndbuf) == -1) {
+                FATAL("invalid TCP incoming send buffer size");
+            }
             break;
         case GETOPT_VAL_TCP_INCOMING_RCVBUF:
-            tcp_incoming_rcvbuf = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &tcp_incoming_rcvbuf) == -1) {
+                FATAL("invalid TCP incoming receive buffer size");
+            }
             break;
         case GETOPT_VAL_TCP_OUTGOING_SNDBUF:
-            tcp_outgoing_sndbuf = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &tcp_outgoing_sndbuf) == -1) {
+                FATAL("invalid TCP outgoing send buffer size");
+            }
             break;
         case GETOPT_VAL_TCP_OUTGOING_RCVBUF:
-            tcp_outgoing_rcvbuf = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &tcp_outgoing_rcvbuf) == -1) {
+                FATAL("invalid TCP outgoing receive buffer size");
+            }
             break;
         case 's':
             if (remote_num < MAX_REMOTE_NUM) {
@@ -1566,7 +1610,9 @@ main(int argc, char **argv)
             break;
 #ifdef HAVE_SETRLIMIT
         case 'n':
-            nofile = atoi(optarg);
+            if (ss_parse_int(optarg, 0, INT_MAX, &nofile) == -1) {
+                FATAL("invalid nofile");
+            }
             break;
 #endif
         case 'u':
@@ -1781,6 +1827,9 @@ main(int argc, char **argv)
     if (timeout == NULL) {
         timeout = "60";
     }
+    if (ss_parse_int(timeout, 1, INT_MAX, &timeout_secs) == -1) {
+        FATAL("invalid timeout");
+    }
 
 #ifdef HAVE_SETRLIMIT
     /*
@@ -1918,7 +1967,7 @@ main(int argc, char **argv)
         if (plugin != NULL)
             break;
     }
-    listen_ctx.timeout = atoi(timeout);
+    listen_ctx.timeout = timeout_secs;
     listen_ctx.iface   = iface;
     listen_ctx.mptcp   = mptcp;
 
@@ -1974,6 +2023,9 @@ main(int argc, char **argv)
         struct sockaddr *addr = (struct sockaddr *)storage;
         udp_fd = init_udprelay(local_addr, local_port, addr,
                                get_sockaddr_len(addr), mtu, crypto, listen_ctx.timeout, iface);
+        if (udp_fd == -1) {
+            FATAL("failed to initialize UDP relay");
+        }
     }
 
 #ifdef HAVE_LAUNCHD
@@ -2037,8 +2089,6 @@ main(int argc, char **argv)
 int
 _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udata)
 {
-    srand(time(NULL));
-
     char *remote_host = profile.remote_host;
     char *local_addr  = profile.local_addr;
     char *method      = profile.method;
@@ -2058,8 +2108,8 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
 
     char local_port_str[16];
     char remote_port_str[16];
-    sprintf(local_port_str, "%d", local_port);
-    sprintf(remote_port_str, "%d", remote_port);
+    snprintf(local_port_str, sizeof(local_port_str), "%d", local_port);
+    snprintf(remote_port_str, sizeof(remote_port_str), "%d", remote_port);
 
 #ifdef __MINGW32__
     winsock_init();
@@ -2108,6 +2158,8 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
 
     struct sockaddr *remote_addr_tmp[MAX_REMOTE_NUM];
     listen_ctx_t listen_ctx;
+    // fd stays -1 in UDP_ONLY mode but is still passed to the callback below
+    listen_ctx.fd             = -1;
     listen_ctx.remote_num     = 1;
     listen_ctx.remote_addr    = remote_addr_tmp;
     listen_ctx.remote_addr[0] = (struct sockaddr *)(&storage);
@@ -2146,6 +2198,9 @@ _start_ss_local_server(profile_t profile, ss_local_callback callback, void *udat
         struct sockaddr *addr = (struct sockaddr *)(&storage);
         udp_fd = init_udprelay(local_addr, local_port_str, addr,
                                get_sockaddr_len(addr), mtu, crypto, timeout, NULL);
+        if (udp_fd == -1) {
+            return -1;
+        }
     }
 
     // Init connections
